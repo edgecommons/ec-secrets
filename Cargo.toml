@@ -1,0 +1,53 @@
+# EdgeCommons Secrets Tool — `ec-secrets`.
+#
+# A standalone ecosystem utility: seed and inspect a LOCAL EdgeCommons credentials vault
+# from the command line. It is a thin CLI over the library's OWN vault (`gg.credentials()`),
+# so what it writes is byte-compatible with what components decrypt — the same envelope
+# encryption, KeyProvider/KEK selection, namespacing, and on-disk format. Scope is the local
+# vault only (no AWS Secrets Manager — that has its own console/CLI).
+#
+# It depends on the EdgeCommons Rust library exactly the way a component repo does — a
+# git-pinned `rev`, with a gitignored `.cargo/config.toml` `[patch]` redirecting the dep to the
+# local sibling checkout for development. CI builds the pinned rev.
+[package]
+name = "ec-secrets"
+version = "0.1.0"
+edition = "2021"
+# Matches the edgecommons library's MSRV (edition-2024 crate).
+rust-version = "1.85"
+license = "BUSL-1.1"
+description = "EdgeCommons secrets tool: seed and inspect a local EdgeCommons credentials vault from the command line."
+publish = false
+
+[[bin]]
+name = "ec-secrets"
+path = "src/main.rs"
+
+[lib]
+name = "ec_secrets"
+path = "src/lib.rs"
+
+# The tool is offline and broker-free — it only opens a local vault file. The `credentials`
+# feature of the library brings in the vault, key providers (file/env), and the typed views;
+# no MQTT/standalone transport is needed.
+#   - default: file + env KEK providers, local vault only.
+#   - kms: add the AWS-KMS KEK custodian (`--key-provider kms`) via `credentials-aws`. Off by
+#     default — it pulls in the AWS SDK and needs live AWS credentials, so plain builds and the
+#     hermetic test suite stay AWS-free.
+[features]
+default = []
+kms = ["edgecommons/credentials-aws"]
+
+[dependencies]
+# The edgecommons Rust library — pinned by git rev (the same rev the reference components pin).
+# The gitignored `.cargo/config.toml` patches this to the local sibling checkout for dev; CI
+# builds the pinned rev. Only the `credentials` feature is needed (local vault, no transport).
+edgecommons = { git = "https://github.com/edgecommons/edgecommons", rev = "91d93d8bca6400615db6f64f6120efc55fc75a1a", default-features = false, features = ["credentials"] }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"

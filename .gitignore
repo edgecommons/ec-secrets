@@ -1,0 +1,3 @@
+/target
+# Local-dev sibling-library path override — never committed (CI uses the pinned rev).
+.cargo/config.toml

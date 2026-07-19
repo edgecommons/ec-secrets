@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+jobs:
+  ci:
+    # Reusable component CI from the org defaults repo (the file-replicator / telemetry-processor /
+    # ec-uns-cmd pattern). `secrets: inherit` passes the org-level EDGECOMMONS_READ_TOKEN so cargo
+    # can fetch the private edgecommons git dependency; the repo must be on that secret's repository
+    # allow-list. The reusable workflow runs `cargo build --all-targets`, `cargo test`, and
+    # `cargo clippy --all-targets -- -D warnings` for `language: RUST` on the default features
+    # (local vault only — the `credentials` feature is on unconditionally via Cargo.toml, and needs
+    # no C toolchain or broker). The `kms` feature (AWS-KMS custodian) pulls in the AWS SDK and live
+    # credentials, so it is not built in this hosted job.
+    permissions:
+      contents: read
+    uses: edgecommons/.github/.github/workflows/component-ci.yml@main
+    with:
+      language: RUST
+    secrets: inherit
