@@ -45,8 +45,14 @@ selectors: `--vault`, `--key-provider file|env|kms`, `--keyfile`, `--kek-env`, `
 `--region`/`--endpoint-url`, `--config`, `--namespace`, `--keep-versions`, `--audit`, `--json`.
 Exit codes: `0` ok · `1` not-found/refused · `2` usage · `3` vault/key-provider error.
 
-`rotate-kek` reports that in-place KEK rotation is **not exposed** by the library (no public re-wrap
-API) and exits `3` — the honest state; there is no hand-rolled re-encryption.
+`rotate-kek` rotates the vault's KEK via a **re-encrypt-all** rotation done entirely in the tool over
+the library's public vault APIs (`--new-key-provider`/`--new-keyfile`/`--new-kek-env`/`--new-kms-*`
+select the destination custodian): it decrypts every secret under the current KEK, writes a fresh
+vault under the new KEK at a temp path, and atomically swaps it in (backing the original up to
+`<vault>.bak`, rolling back on failure). Each secret is briefly decrypted in process — it is **not**
+an envelope-only DEK re-wrap; a true in-place re-wrap would need a new `pub` method in the credentials
+library (a four-language parity change — a follow-up). It rotates the whole vault (all namespaces) and
+keeps the latest version of each secret.
 
 ## Layout
 
@@ -77,7 +83,7 @@ secret), then reference it from the adapter config with `{"$secret":"tls/cip-cli
 ```bash
 cargo build --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test          # 12 unit + 6 hermetic integration tests (no external infra)
+cargo test          # 14 unit + 8 hermetic integration tests (no external infra)
 ```
 
 The integration suite creates a temp vault with a `file` KeyProvider, seeds it via the tool's real

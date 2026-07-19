@@ -29,6 +29,9 @@
 //!
 //! [`format`]: edgecommons::credentials::format
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use edgecommons::credentials::{
@@ -170,8 +173,75 @@ pub enum Command {
         #[arg(long, value_name = "FORMAT")]
         format: Option<ImportFormat>,
     },
-    /// Re-encrypt the vault under a new KEK. Not exposed by the library (see the CLI reference).
-    RotateKek,
+    /// Rotate the vault's KEK: decrypt every secret under the current KEK and re-encrypt it under a
+    /// NEW one, then atomically swap the new vault into place (backing up the original to
+    /// `<vault>.bak`).
+    ///
+    /// The SOURCE vault + current KEK come from the global flags (`--vault`, `--key-provider`,
+    /// `--keyfile`/`--kek-env`/…); the `--new-*` flags below select the NEW KEK/provider, mirroring
+    /// the global ones. This is a **re-encrypt-all** rotation (each secret is briefly decrypted in
+    /// process, then re-sealed under the new KEK), not an envelope-only DEK re-wrap — a true in-place
+    /// re-wrap would need a `pub` API in the credentials library. It rotates the WHOLE vault (every
+    /// namespace), keeping the latest version of each secret.
+    RotateKek {
+        /// The NEW KEK custodian: `file`, `env`, or `kms` (needs the `kms` build feature). Defaults
+        /// to the provider implied by whichever `--new-*` selector is given (else `file`).
+        #[arg(long, value_name = "KIND")]
+        new_key_provider: Option<String>,
+        /// NEW KEK key file (32 raw bytes) for `--new-key-provider file`. Generated if absent (as the
+        /// vault-open path does); an existing file is loaded as the new KEK. Defaults to `<vault>.key`.
+        #[arg(long, value_name = "PATH")]
+        new_keyfile: Option<String>,
+        /// Env var holding the base64 32-byte NEW KEK for `--new-key-provider env`.
+        #[arg(long, value_name = "VAR")]
+        new_kek_env: Option<String>,
+        /// AWS KMS key id/ARN for `--new-key-provider kms` (needs the `kms` build feature).
+        #[arg(long, value_name = "ID")]
+        new_kms_key_id: Option<String>,
+        /// AWS region for the `kms` NEW key provider.
+        #[arg(long, value_name = "REGION")]
+        new_region: Option<String>,
+        /// Override the KMS endpoint URL for the `kms` NEW key provider.
+        #[arg(long, value_name = "URL")]
+        new_endpoint_url: Option<String>,
+    },
+}
+
+/// The NEW KEK/provider selection for [`rotate_kek`] — mirrors the global vault-selection flags but
+/// picks the *destination* custodian a rotation re-encrypts the vault under.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewKekSelection {
+    /// The new custodian kind (`file`/`env`/`kms`); `None` ⇒ inferred from the selectors below.
+    pub key_provider: Option<String>,
+    /// New keyfile path for the `file` custodian (generated if absent; defaults to `<vault>.key`).
+    pub keyfile: Option<String>,
+    /// Env var name for the `env` custodian.
+    pub kek_env: Option<String>,
+    /// KMS key id/ARN for the `kms` custodian.
+    pub kms_key_id: Option<String>,
+    /// AWS region for the `kms` custodian.
+    pub region: Option<String>,
+    /// KMS endpoint override for the `kms` custodian.
+    pub endpoint_url: Option<String>,
+}
+
+impl NewKekSelection {
+    /// The effective destination custodian kind: the explicit `--new-key-provider`, else inferred
+    /// from whichever `--new-*` selector is present (keyfile ⇒ `file`, kek-env ⇒ `env`,
+    /// kms-key-id ⇒ `kms`), else the library default `file`.
+    pub fn effective_kind(&self) -> String {
+        self.key_provider.clone().unwrap_or_else(|| {
+            if self.kek_env.is_some() {
+                "env"
+            } else if self.kms_key_id.is_some() {
+                "kms"
+            } else {
+                // keyfile-implied or nothing given → the offline `file` custodian.
+                "file"
+            }
+            .to_string()
+        })
+    }
 }
 
 /// The bulk-import input format.
@@ -551,15 +621,235 @@ pub fn run(cli: &Cli, svc: &dyn CredentialService) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::Ok)
         }
 
-        Command::RotateKek => {
-            eprintln!(
-                "ec-secrets: in-place KEK rotation is not exposed by the edgecommons library \
-                 (no public re-wrap API). To change custodians, open a fresh vault under the new \
-                 --key-provider and re-import the secrets (e.g. `ec-secrets get`/`set` or an \
-                 exported JSON)."
-            );
-            Ok(ExitCode::VaultError)
+        Command::RotateKek {
+            new_key_provider,
+            new_keyfile,
+            new_kek_env,
+            new_kms_key_id,
+            new_region,
+            new_endpoint_url,
+        } => {
+            let selection = NewKekSelection {
+                key_provider: new_key_provider.clone(),
+                keyfile: new_keyfile.clone(),
+                kek_env: new_kek_env.clone(),
+                kms_key_id: new_kms_key_id.clone(),
+                region: new_region.clone(),
+                endpoint_url: new_endpoint_url.clone(),
+            };
+            rotate_kek(cli, &selection)
         }
+    }
+}
+
+/// One secret carried across a rotation: its full on-disk key, decrypted bytes (briefly in memory),
+/// and the metadata `put` can reproduce (content-type + labels). Version id and `createdMs` are not
+/// carried — the public `put` mints a fresh version, so only the latest value is rotated.
+struct RotatedSecret {
+    name: String,
+    bytes: Vec<u8>,
+    content_type: String,
+    labels: BTreeMap<String, String>,
+}
+
+/// Rotate the vault's KEK by re-encrypting every secret under a NEW custodian.
+///
+/// This is a **re-encrypt-all** rotation, performed entirely in the tool over the library's public
+/// vault APIs: it opens the source vault with the current KEK, decrypts the latest version of every
+/// secret (across all namespaces), builds a brand-new vault under the new KEK at a temp path, writes
+/// each secret into it, and then **atomically** swaps the new vault file into place — backing the
+/// original up to `<vault>.bak` and rolling back on any failure, so a vault is never left
+/// half-rotated. Each secret is briefly held decrypted in process during the copy; this is not an
+/// envelope-only DEK re-wrap (a true in-place re-wrap would require a `pub` method in the credentials
+/// library — a follow-up). Only the latest version of each secret is carried over: the library's
+/// public `put` mints a fresh version id and timestamp, so historical versions/`createdMs` cannot be
+/// faithfully reproduced through the public API.
+///
+/// # Errors
+/// Returns an error (mapped to exit `3`) if the source vault cannot be opened with the current KEK,
+/// the new provider is unavailable (e.g. a missing `env` KEK, or `kms` without the build feature),
+/// the requested new keyfile is the current one (a no-op rotation), or an I/O step fails. On any
+/// failure the original vault is left intact.
+pub fn rotate_kek(cli: &Cli, new: &NewKekSelection) -> anyhow::Result<ExitCode> {
+    // --- 1. Source: the vault path + current KEK come from the global flags. ---
+    let src_cfg = build_credentials_config(cli)?;
+    let vault_path = src_cfg.vault.path.clone();
+    let src_kind = src_cfg
+        .vault
+        .key_provider
+        .kind
+        .clone()
+        .unwrap_or_else(|| "file".to_string());
+    // The current `file` keyfile (explicit or the `<vault>.key` default) — used to refuse a
+    // rotation whose "new" keyfile is really the current one.
+    let src_key_path = src_cfg
+        .vault
+        .key_provider
+        .key_path
+        .clone()
+        .unwrap_or_else(|| format!("{vault_path}.key"));
+
+    // --- 2. Open the source vault RAW (no namespace) so EVERY secret is rotated, not just one
+    // component's namespace. Auditing is silenced for the bulk read. ---
+    let mut src_read_cfg = src_cfg.clone();
+    src_read_cfg.audit = AuditConfig { enabled: false };
+    let source = open_namespaced_with_default(&src_read_cfg, "", None)
+        .context("open the source vault with the current KEK")?;
+
+    // --- 3. Decrypt the latest version of every secret (full on-disk keys, all namespaces). ---
+    let metas = source.list("").context("enumerate the vault's secrets")?;
+    let mut items: Vec<RotatedSecret> = Vec::with_capacity(metas.len());
+    for m in &metas {
+        let secret = source
+            .get(&m.name)?
+            .ok_or_else(|| anyhow::anyhow!("secret '{}' vanished mid-rotation", m.name))?;
+        items.push(RotatedSecret {
+            name: secret.name.clone(),
+            bytes: secret.bytes().to_vec(),
+            content_type: secret.content_type.clone(),
+            labels: secret.labels.clone(),
+        });
+    }
+
+    // --- 4. Stage the new vault on the SAME filesystem as the target (so the swap rename is atomic). ---
+    let parent = Path::new(&vault_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&parent).ok();
+    let staging = tempfile::Builder::new()
+        .prefix(".ec-secrets-rotate-")
+        .tempdir_in(&parent)
+        .context("create the rotation staging directory next to the vault")?;
+    let temp_vault = staging.path().join("vault");
+
+    // --- 5. Build the DEST provider config, deciding how the new keyfile is placed. ---
+    let new_kind = new.effective_kind();
+    let mut dest_cfg = src_cfg.clone();
+    dest_cfg.audit = AuditConfig { enabled: false };
+    dest_cfg.vault.path = temp_vault.to_string_lossy().into_owned();
+    let mut kp = KeyProviderConfig {
+        kind: Some(new_kind.clone()),
+        env_var: new.kek_env.clone(),
+        kms_key_id: new.kms_key_id.clone(),
+        region: new.region.clone(),
+        endpoint_url: new.endpoint_url.clone(),
+        ..KeyProviderConfig::default()
+    };
+
+    // For the `file` custodian: an existing new keyfile is loaded in place; a not-yet-existing one is
+    // generated in staging and swapped into its final location alongside the vault.
+    let mut keyfile_swap: Option<(PathBuf, PathBuf)> = None; // (staged, final)
+    if new_kind == "file" {
+        let final_keyfile = new
+            .keyfile
+            .clone()
+            .unwrap_or_else(|| format!("{vault_path}.key"));
+        let final_pb = PathBuf::from(&final_keyfile);
+        if final_pb.exists() {
+            // Reuse the existing keyfile as the new KEK — but refuse a no-op rotation to the current one.
+            if src_kind == "file" && same_file(&final_pb, Path::new(&src_key_path)) {
+                bail!(
+                    "--new-keyfile {final_keyfile} is the current keyfile — that would re-encrypt \
+                     under the SAME KEK; point --new-keyfile at a different (new) path, or pick \
+                     another --new-key-provider"
+                );
+            }
+            kp.key_path = Some(final_keyfile);
+        } else {
+            // Generate a fresh key in staging; install it during the atomic swap.
+            let staged_key = staging.path().join("new.key");
+            kp.key_path = Some(staged_key.to_string_lossy().into_owned());
+            keyfile_swap = Some((staged_key, final_pb));
+        }
+    }
+    dest_cfg.vault.key_provider = kp;
+
+    // --- 6. Create the new vault under the new KEK and re-encrypt every secret into it. ---
+    let dest = open_namespaced_with_default(&dest_cfg, "", None)
+        .context("create the new vault under the new KEK")?;
+    for item in &items {
+        let opts = PutOptions {
+            content_type: Some(item.content_type.clone()),
+            labels: item.labels.clone(),
+            ..PutOptions::default()
+        };
+        dest.put(&item.name, &item.bytes, opts)
+            .with_context(|| format!("re-encrypt secret '{}' under the new KEK", item.name))?;
+    }
+    // Release the vault handles (and their locks) before swapping files.
+    drop(dest);
+    drop(source);
+
+    if !temp_vault.exists() {
+        bail!("internal error: the staged vault was not written");
+    }
+
+    // --- 7. Atomic swap: back up the original vault, install the new keyfile, then rename the new
+    // vault into place. `std::fs::rename` replaces the target atomically on both Unix and Windows. ---
+    let vault_pb = PathBuf::from(&vault_path);
+    let vault_bak = PathBuf::from(format!("{vault_path}.bak"));
+    if vault_pb.exists() {
+        std::fs::copy(&vault_pb, &vault_bak)
+            .with_context(|| format!("back up the original vault to {}", vault_bak.display()))?;
+    }
+
+    // 7a. Install the new keyfile FIRST (so the key that opens the new vault is present), backing up
+    // any file already at the final path.
+    let mut keyfile_bak: Option<PathBuf> = None;
+    if let Some((staged, final_path)) = &keyfile_swap {
+        if final_path.exists() {
+            let bak = PathBuf::from(format!("{}.bak", final_path.display()));
+            std::fs::copy(final_path, &bak)
+                .with_context(|| format!("back up the existing keyfile to {}", bak.display()))?;
+            keyfile_bak = Some(bak);
+        }
+        std::fs::rename(staged, final_path)
+            .with_context(|| format!("install the new keyfile at {}", final_path.display()))?;
+    }
+
+    // 7b. Swap the vault. On failure, roll the keyfile back so the ORIGINAL vault still opens.
+    if let Err(e) = std::fs::rename(&temp_vault, &vault_pb) {
+        if let Some((_, final_path)) = &keyfile_swap {
+            let _ = std::fs::remove_file(final_path);
+            if let Some(bak) = &keyfile_bak {
+                let _ = std::fs::rename(bak, final_path);
+            }
+        }
+        return Err(anyhow::Error::new(e).context("install the rotated vault at the target path"));
+    }
+
+    // --- 8. Summary. The vault now requires the NEW key material; the old KEK no longer opens it. ---
+    let n = items.len();
+    if cli.json {
+        print_json(&json!({
+            "rotated": n,
+            "vault": vault_path,
+            "backup": vault_bak.to_string_lossy(),
+            "fromProvider": src_kind,
+            "toProvider": new_kind,
+        }));
+    } else {
+        println!(
+            "rotated {n} secret(s) in {vault_path}: {src_kind} → {new_kind} KEK \
+             (backup: {})",
+            vault_bak.display()
+        );
+        println!(
+            "the vault now opens ONLY under the new KEK; reopen it with the --new-* selectors you \
+             chose (the old key material no longer decrypts it)."
+        );
+    }
+    Ok(ExitCode::Ok)
+}
+
+/// Whether two paths refer to the same file. Compares canonicalized paths when both resolve, else
+/// falls back to a literal path comparison.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
     }
 }
 
@@ -835,6 +1125,88 @@ TRAILING=value # trailing comment
                 ..
             }
         ));
+    }
+
+    // ---- rotate-kek arg parsing ----
+    #[test]
+    fn cli_parses_rotate_kek_new_flags() {
+        let cli = Cli::try_parse_from([
+            "ec-secrets",
+            "--vault",
+            "/tmp/v",
+            "rotate-kek",
+            "--new-key-provider",
+            "file",
+            "--new-keyfile",
+            "/tmp/new.key",
+            "--new-kek-env",
+            "NEW_KEK",
+            "--new-kms-key-id",
+            "arn:aws:kms:key/abc",
+            "--new-region",
+            "us-east-1",
+            "--new-endpoint-url",
+            "http://localhost:4566",
+        ])
+        .unwrap();
+        let Command::RotateKek {
+            new_key_provider,
+            new_keyfile,
+            new_kek_env,
+            new_kms_key_id,
+            new_region,
+            new_endpoint_url,
+        } = &cli.command
+        else {
+            panic!("expected RotateKek");
+        };
+        assert_eq!(new_key_provider.as_deref(), Some("file"));
+        assert_eq!(new_keyfile.as_deref(), Some("/tmp/new.key"));
+        assert_eq!(new_kek_env.as_deref(), Some("NEW_KEK"));
+        assert_eq!(new_kms_key_id.as_deref(), Some("arn:aws:kms:key/abc"));
+        assert_eq!(new_region.as_deref(), Some("us-east-1"));
+        assert_eq!(new_endpoint_url.as_deref(), Some("http://localhost:4566"));
+    }
+
+    #[test]
+    fn new_kek_selection_infers_provider_kind() {
+        // Explicit kind wins.
+        assert_eq!(
+            NewKekSelection {
+                key_provider: Some("env".into()),
+                keyfile: Some("k".into()),
+                ..NewKekSelection::default()
+            }
+            .effective_kind(),
+            "env"
+        );
+        // Otherwise inferred from the selector present.
+        assert_eq!(
+            NewKekSelection {
+                kek_env: Some("V".into()),
+                ..NewKekSelection::default()
+            }
+            .effective_kind(),
+            "env"
+        );
+        assert_eq!(
+            NewKekSelection {
+                kms_key_id: Some("id".into()),
+                ..NewKekSelection::default()
+            }
+            .effective_kind(),
+            "kms"
+        );
+        // keyfile-implied, and the empty default, both resolve to the offline `file` custodian.
+        assert_eq!(
+            NewKekSelection {
+                keyfile: Some("k".into()),
+                ..NewKekSelection::default()
+            }
+            .effective_kind(),
+            "file"
+        );
+        assert_eq!(NewKekSelection::default().effective_kind(), "file");
     }
 
     #[test]

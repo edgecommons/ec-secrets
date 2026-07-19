@@ -23,6 +23,8 @@ own console and CLI for that, and EdgeCommons syncs from Secrets Manager at runt
 - `list` prints names and metadata only, never values.
 - `delete` removes a secret.
 - `import` bulk-seeds from a JSON object (`{"name": "value", …}`) or a dotenv (`KEY=VALUE`) file.
+- `rotate-kek` rotates the vault's KEK — it re-encrypts every secret under a new custodian and
+  atomically swaps the new vault in (backing the original up to `<vault>.bak`).
 
 Because it writes through the library's own vault, a component immediately decrypts what you seed —
 no format guessing, no bespoke crypto.
@@ -59,7 +61,7 @@ ec-secrets [--vault <path>] [--key-provider file|env|kms] [--keyfile <f> | --kek
   list [--prefix <p>]
   delete <name>
   import <file> [--format json|env]
-  rotate-kek
+  rotate-kek [--new-key-provider file|env|kms] [--new-keyfile <f> | --new-kek-env <VAR>]
 ```
 
 Every flag is documented in [`docs/reference/cli.md`](docs/reference/cli.md).
@@ -105,6 +107,21 @@ Select the vault and key provider from an existing component config's `credentia
 ec-secrets --config ./component-config.json set db/password 's3cr3t'
 ```
 
+Rotate the vault's KEK — re-encrypt every secret under a fresh keyfile (current KEK from the global
+flags, new KEK from `--new-*`):
+
+```bash
+ec-secrets --vault ./vault --keyfile ./old.key rotate-kek --new-key-provider file --new-keyfile ./new.key
+# rotated 3 secret(s) in ./vault: file → file KEK (backup: ./vault.bak)
+# the vault now opens ONLY under the new KEK; reopen it with the --new-* selectors you chose …
+ec-secrets --vault ./vault --keyfile ./new.key get db/password   # decrypts under the new KEK
+```
+
+This is a re-encrypt-all rotation (each secret is briefly decrypted, then re-sealed under the new
+KEK), made atomic by staging the new vault and swapping it in with a `<vault>.bak` backup. It is not
+an envelope-only DEK re-wrap — that would need a new public API in the credentials library. It keeps
+the latest version of each secret. See [`docs/reference/cli.md`](docs/reference/cli.md#rotate-kek).
+
 ## How it fits the ecosystem
 
 - **The library's own vault.** `ec-secrets` calls `edgecommons::credentials::open_namespaced_with_default`
@@ -144,7 +161,7 @@ ec-secrets --config ./component-config.json set db/password 's3cr3t'
 ```bash
 cargo build --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test          # 12 unit + 6 hermetic integration tests (no external infra)
+cargo test          # 14 unit + 8 hermetic integration tests (no external infra)
 ```
 
 The integration suite (`tests/seed_and_readback.rs`) creates a temp vault, seeds it through the

@@ -222,15 +222,134 @@ fn wrong_kek_fails_closed_on_open() {
 }
 
 #[test]
-fn rotate_kek_reports_unavailable() {
+fn rotate_kek_reencrypts_under_the_new_keyfile() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    let key_a = dir.path().join("a.key"); // the CURRENT KEK
+    let key_b = dir.path().join("b.key"); // the NEW KEK (does not exist yet)
+    let (vs, ka, kb) = (
+        vault.to_str().unwrap(),
+        key_a.to_str().unwrap(),
+        key_b.to_str().unwrap(),
+    );
+
+    // --- Seed several secrets (incl. a JSON typed-view secret) under KEK A. ---
+    for (n, v) in [("db/password", "s3cr3t"), ("svc/token", "tok-123")] {
+        assert_eq!(
+            ec_secrets(&["--vault", vs, "--keyfile", ka, "set", n, v]),
+            ExitCode::Ok
+        );
+    }
+    assert_eq!(
+        ec_secrets(&[
+            "--vault", vs, "--keyfile", ka, "set", "aws/main",
+            r#"{"accessKeyId":"AKIA","secretAccessKey":"sk"}"#,
+        ]),
+        ExitCode::Ok
+    );
+
+    // --- Rotate: current KEK = A (global flags), new KEK = a fresh file B. ---
+    assert_eq!(
+        ec_secrets(&[
+            "--vault", vs, "--keyfile", ka, "rotate-kek", "--new-key-provider", "file",
+            "--new-keyfile", kb,
+        ]),
+        ExitCode::Ok
+    );
+
+    // A `.bak` of the original vault must exist after an atomic rotation.
+    assert!(
+        vault.with_extension("bak").exists(),
+        "rotation must back the original vault up to <vault>.bak"
+    );
+
+    // --- All secrets decrypt through the LIBRARY read path under the NEW KEK B, and the count matches. ---
+    let under_b = open(&component_config(&vault, &key_b)).expect("open under the new KEK B");
+    assert_eq!(under_b.get_string("db/password").unwrap().unwrap(), "s3cr3t");
+    assert_eq!(under_b.get_string("svc/token").unwrap().unwrap(), "tok-123");
+    let aws = under_b.get_aws_credentials("aws/main").unwrap().unwrap();
+    assert_eq!(aws.access_key_id, "AKIA");
+    assert_eq!(aws.secret_access_key, "sk");
+    assert_eq!(under_b.list("").unwrap().len(), 3, "all three secrets carried over");
+
+    // --- The vault must NOT open under the OLD KEK A anymore (old KEK rejected, fail-closed). ---
+    let under_a = open(&component_config(&vault, &key_a));
+    assert!(
+        under_a.is_err(),
+        "the rotated vault must reject the old KEK A (envelope re-encrypted under B)"
+    );
+}
+
+#[test]
+fn rotate_kek_failure_leaves_the_original_vault_intact() {
+    // Atomicity: if the NEW provider is unavailable, rotation must fail BEFORE any swap and leave the
+    // source vault fully readable under its original KEK, with no `.bak` created.
     let dir = tempfile::tempdir().unwrap();
     let vault = dir.path().join("vault");
     let keyfile = dir.path().join("vault.key");
     let (vs, ks) = (vault.to_str().unwrap(), keyfile.to_str().unwrap());
-    assert_eq!(ec_secrets(&["--vault", vs, "--keyfile", ks, "set", "k", "v"]), ExitCode::Ok);
-    // The library exposes no in-place KEK re-wrap; the command reports that (exit 3).
+
     assert_eq!(
-        ec_secrets(&["--vault", vs, "--keyfile", ks, "rotate-kek"]),
-        ExitCode::VaultError
+        ec_secrets(&["--vault", vs, "--keyfile", ks, "set", "keep", "me"]),
+        ExitCode::Ok
     );
+
+    // Rotate to an `env` KEK whose env var is unset → build_key_provider fails when creating the new
+    // vault, before the swap. Drive run() directly so we can assert the error (rather than exit code).
+    let cli = Cli::try_parse_from([
+        "ec-secrets",
+        "--vault",
+        vs,
+        "--keyfile",
+        ks,
+        "rotate-kek",
+        "--new-key-provider",
+        "env",
+        "--new-kek-env",
+        "EC_SECRETS_ROTATE_MISSING_KEK_VAR",
+    ])
+    .unwrap();
+    let svc = open_service(&cli).expect("open source vault");
+    assert!(
+        run(&cli, &svc).is_err(),
+        "rotating to an unavailable provider must error"
+    );
+
+    // The original vault is untouched: still opens under the original KEK with the secret intact,
+    // and no `.bak` was left behind.
+    assert!(
+        !vault.with_extension("bak").exists(),
+        "a pre-swap failure must not create a <vault>.bak"
+    );
+    let component = open(&component_config(&vault, &keyfile)).expect("original vault still opens");
+    assert_eq!(component.get_string("keep").unwrap().unwrap(), "me");
+}
+
+#[test]
+fn rotate_kek_refuses_the_current_keyfile() {
+    // Rotating "to" the current keyfile would re-encrypt under the same KEK — a no-op that must be
+    // refused, leaving the vault untouched.
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    let keyfile = dir.path().join("vault.key");
+    let (vs, ks) = (vault.to_str().unwrap(), keyfile.to_str().unwrap());
+
+    assert_eq!(ec_secrets(&["--vault", vs, "--keyfile", ks, "set", "k", "v"]), ExitCode::Ok);
+
+    let cli = Cli::try_parse_from([
+        "ec-secrets",
+        "--vault",
+        vs,
+        "--keyfile",
+        ks,
+        "rotate-kek",
+        "--new-key-provider",
+        "file",
+        "--new-keyfile",
+        ks, // same as the current keyfile
+    ])
+    .unwrap();
+    let svc = open_service(&cli).expect("open source vault");
+    assert!(run(&cli, &svc).is_err(), "rotating to the current keyfile must be refused");
+    assert!(!vault.with_extension("bak").exists(), "the refused rotation must not touch the vault");
 }

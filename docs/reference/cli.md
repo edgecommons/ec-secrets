@@ -18,7 +18,7 @@ component decrypts.
 | `list` | Print secret names and metadata (version, source) — never values. |
 | `delete <name>` | Remove a secret entirely. |
 | `import <file>` | Bulk-seed from a JSON object (`{"name":"value",…}`) or a dotenv (`KEY=VALUE`) file. |
-| `rotate-kek` | Re-encrypt the vault under a new KEK. **Unavailable** — see [rotate-kek](#rotate-kek). |
+| `rotate-kek` | Rotate the vault's KEK: re-encrypt every secret under a NEW custodian and atomically swap it in. See [rotate-kek](#rotate-kek). |
 
 ## Global options (vault + key-provider selection)
 
@@ -111,12 +111,45 @@ dotenv) and then the content (a leading `{` is JSON), or forced with `--format`.
 
 ## rotate-kek
 
-In-place KEK rotation re-wraps the vault's Data Encryption Key under a new KEK without touching the
-encrypted records. The EdgeCommons library does not expose a public re-wrap API, so `ec-secrets`
-cannot perform it and does not hand-roll vault crypto. The command reports this and exits `3`.
+```text
+ec-secrets rotate-kek [--new-key-provider file|env|kms]
+                      [--new-keyfile <PATH>] [--new-kek-env <VAR>]
+                      [--new-kms-key-id <ID>] [--new-region <REGION>] [--new-endpoint-url <URL>]
+```
 
-To change custodians, open a fresh vault under the new `--key-provider` and re-seed it (for example
-from an exported JSON of the current secrets).
+Rotates the vault's KEK. The SOURCE vault and current KEK are selected by the global flags
+(`--vault`, `--key-provider`, `--keyfile`/`--kek-env`/…); the `--new-*` options select the NEW
+custodian, mirroring the global ones.
+
+| Option | Meaning |
+|--------|---------|
+| `--new-key-provider <KIND>` | The new KEK custodian: `file`, `env`, or `kms`. Defaults to the provider implied by whichever `--new-*` selector is given (`--new-keyfile` ⇒ `file`, `--new-kek-env` ⇒ `env`, `--new-kms-key-id` ⇒ `kms`), else `file`. |
+| `--new-keyfile <PATH>` | New keyfile (32 raw bytes) for `--new-key-provider file`. Generated if absent (as the vault-open path does); an existing file is loaded as the new KEK. Defaults to `<vault>.key` — which is refused when it is the current keyfile. |
+| `--new-kek-env <VAR>` | Env var holding the base64 32-byte new KEK for `--new-key-provider env`. |
+| `--new-kms-key-id <ID>` / `--new-region <REGION>` / `--new-endpoint-url <URL>` | New `kms` custodian selection (needs the `kms` build feature). |
+
+**How it works — a re-encrypt-all rotation.** The EdgeCommons library exposes no public in-place DEK
+re-wrap, so `ec-secrets` performs the rotation itself over the library's public vault APIs: it opens
+the source vault with the current KEK, decrypts the latest version of every secret (across all
+namespaces), builds a brand-new vault under the new KEK at a temp path on the same filesystem, writes
+every secret into it, and then **atomically** renames the new vault over the original — backing the
+original up to `<vault>.bak` first and rolling back on any failure, so a vault is never left
+half-rotated. For the `file` custodian a freshly generated new keyfile is installed alongside the
+vault in the same swap.
+
+This means each secret is **briefly decrypted in process** and re-sealed under the new KEK; it is not
+an envelope-only re-wrap of the untouched ciphertext. A true in-place DEK re-wrap would require a new
+`pub` method in the credentials library (a four-language parity change) — a follow-up. Only the
+**latest version** of each secret is carried over: the library's public `put` mints a fresh version
+id and timestamp, so historical versions and original `createdMs` are not reproduced.
+
+After rotation the vault opens **only** under the new KEK — reopen it with the `--new-*` key material
+you chose (`--keyfile <new>` / `--kek-env <VAR>` / …); the old KEK no longer decrypts it. The
+`<vault>.bak` (encrypted under the old KEK) is left for rollback.
+
+A failure before the swap (an unavailable new provider — a missing `env` KEK, or `kms` without the
+build feature — or a no-op rotation to the current keyfile) leaves the original vault untouched and
+exits `3`.
 
 ## The vault and key provider
 

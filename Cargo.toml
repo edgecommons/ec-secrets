@@ -48,6 +48,9 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `rotate-kek` stages the re-encrypted vault in a temp dir on the same filesystem as the target
+# before the atomic swap, so tempfile is a runtime dependency (not just a test one).
+tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"
