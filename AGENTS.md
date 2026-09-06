@@ -67,7 +67,7 @@ keeps the latest version of each secret.
 
 - **Depends on `edgecommons` by pinned git `rev`** (the `credentials` feature; same rev the
   reference components pin). A gitignored `.cargo/config.toml` patches it to
-  `../edgecommons/core/libs/rust` for dev; CI uses the pinned rev. Do NOT edit `.cargo/config.toml`
+  `../core/libs/rust` for dev; CI uses the pinned rev. Do NOT edit `.cargo/config.toml`
   or the pin as part of feature work.
 - **stdout is the command output only**; logs go to stderr (pipe-friendly).
 - **BUSL-1.1**, `publish = false`.

@@ -45,7 +45,7 @@ for the reference layout):
 
 ```toml
 [patch."https://github.com/edgecommons/edgecommons"]
-edgecommons = { path = "../edgecommons/core/libs/rust" }
+edgecommons = { path = "../core/libs/rust" }
 
 [net]
 git-fetch-with-cli = true
